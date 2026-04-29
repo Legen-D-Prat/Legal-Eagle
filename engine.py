@@ -78,20 +78,26 @@ def embed(texts: list[str]) -> list[list[float]]:
 
 # ── Groq LLM call ──────────────────────────────────────────────────────────────
 def call_llm(system: str, user: str, api_key: str, max_tokens: int = 600) -> str:
-    resp = requests.post(
-        GROQ_API_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": GROQ_MODEL,
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-        },
-        timeout=30,
-    )
+    import json as _json
+    key = api_key.strip()
+    payload = _json.dumps({
+        "model": GROQ_MODEL,
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+    })
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(GROQ_API_URL, headers=headers, data=payload,
+                         allow_redirects=False, timeout=30)
+    if resp.status_code in (301, 302, 307, 308):
+        loc = resp.headers.get("Location", GROQ_API_URL)
+        resp = requests.post(loc, headers=headers, data=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
 
