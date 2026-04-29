@@ -1,17 +1,16 @@
 """
 engine.py — RAG pipeline for Legal Eagle.
-Pure-Python vector store (numpy only) — no ChromaDB, no protobuf, no compatibility issues.
-Uses PyMuPDF for PDF parsing and Groq (free) with LLaMA 3 as the LLM.
+Uses PyMuPDF for PDF parsing, a pure-numpy vector store, and
+the official Groq SDK (no redirect issues) with LLaMA 3.1 as the LLM.
 """
 
-import re, json, hashlib
+import re, json, hashlib, time
 import numpy as np
 import fitz  # PyMuPDF
-import requests
+from groq import Groq
 from prompts import SYSTEM_PROMPT, CLAUSE_PROMPT, SUMMARY_PROMPT
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama-3.1-8b-instant"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 CATEGORIES = [
     "Indemnity",
@@ -36,23 +35,20 @@ KEYWORDS = {
 }
 
 
-# ── Lightweight numpy vector store (replaces ChromaDB) ────────────────────────
+# ── Pure-numpy vector store (no ChromaDB needed) ───────────────────────────────
 class VectorStore:
-    """Simple cosine-similarity vector store backed by numpy arrays."""
-
     def __init__(self):
-        self.docs: list[str] = []
-        self.matrix: np.ndarray | None = None  # shape (n, DIM)
+        self.docs = []
+        self.matrix = None
 
-    def add(self, documents: list[str], embeddings: list[list[float]]):
+    def add(self, documents, embeddings):
         self.docs = documents
         self.matrix = np.array(embeddings, dtype=np.float32)
 
-    def query(self, query_embedding: list[float], n: int = 5) -> list[str]:
-        if self.matrix is None or len(self.docs) == 0:
+    def query(self, query_embedding, n=5):
+        if self.matrix is None or not self.docs:
             return []
         qvec = np.array(query_embedding, dtype=np.float32)
-        # Cosine similarity = dot product (both already unit-normalised)
         scores = self.matrix @ qvec
         top_k = min(n, len(self.docs))
         top_idx = np.argpartition(scores, -top_k)[-top_k:]
@@ -60,8 +56,8 @@ class VectorStore:
         return [self.docs[i] for i in top_idx]
 
 
-# ── Hash-based embedding (no model downloads, no GPU) ─────────────────────────
-def embed(texts: list[str]) -> list[list[float]]:
+# ── Hash-based embedding (no GPU / downloads needed) ──────────────────────────
+def embed(texts):
     DIM = 384
     out = []
     for text in texts:
@@ -76,34 +72,37 @@ def embed(texts: list[str]) -> list[list[float]]:
     return out
 
 
-# ── Groq LLM call ──────────────────────────────────────────────────────────────
-def call_llm(system: str, user: str, api_key: str, max_tokens: int = 600) -> str:
-    import json as _json
-    key = api_key.strip()
-    payload = _json.dumps({
-        "model": GROQ_MODEL,
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-    })
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    resp = requests.post(GROQ_API_URL, headers=headers, data=payload,
-                         allow_redirects=False, timeout=30)
-    if resp.status_code in (301, 302, 307, 308):
-        loc = resp.headers.get("Location", GROQ_API_URL)
-        resp = requests.post(loc, headers=headers, data=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+# ── Groq LLM call via official SDK (handles auth + HTTP correctly) ─────────────
+def call_llm(client, system, user, max_tokens=600):
+    """Call Groq with automatic retry on rate-limit (429) errors."""
+    for attempt in range(4):
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower() or "too many" in err.lower():
+                wait = 20 * (attempt + 1)   # 20s → 40s → 60s → 80s
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(
+        "Groq rate limit hit after 4 retries. "
+        "Wait ~1 minute, then try again. "
+        "Free tier allows ~30 requests/min."
+    )
 
 
 # ── Sentence Window Parser ─────────────────────────────────────────────────────
-def parse_windows(text: str, window: int = 4, stride: int = 2) -> list[str]:
+def parse_windows(text, window=4, stride=2):
     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text.strip())
     sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
     chunks = []
@@ -115,7 +114,8 @@ def parse_windows(text: str, window: int = 4, stride: int = 2) -> list[str]:
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
-def analyse_contract(pdf_path: str, api_key: str, progress=None) -> dict:
+def analyse_contract(pdf_path, api_key, progress=None):
+    client = Groq(api_key=api_key.strip())
 
     # 1. Extract PDF text
     if progress: progress(0.05, "Extracting text from PDF...")
@@ -126,18 +126,21 @@ def analyse_contract(pdf_path: str, api_key: str, progress=None) -> dict:
     # 2. Detect document type
     if progress: progress(0.15, "Identifying document type...")
     doc_type = call_llm(
+        client,
         system="You are a legal document classifier.",
-        user=f"What type of legal document is this? Reply with ONLY one of: NDA, Lease, Service Agreement, Employment Contract, Other.\n\n{full_text[:800]}",
-        api_key=api_key,
+        user=(
+            "What type of legal document is this? "
+            "Reply with ONLY one of: NDA, Lease, Service Agreement, Employment Contract, Other.\n\n"
+            + full_text[:800]
+        ),
         max_tokens=10,
     )
 
-    # 3. Sentence windows + embed + index
+    # 3. Build vector index
     if progress: progress(0.25, "Building vector index...")
     chunks = parse_windows(full_text)
-    embeddings = embed(chunks)
     vs = VectorStore()
-    vs.add(chunks, embeddings)
+    vs.add(chunks, embed(chunks))
 
     # 4. Agentic loop — analyse each category
     analyses = []
@@ -159,14 +162,17 @@ def analyse_contract(pdf_path: str, api_key: str, progress=None) -> dict:
             continue
 
         raw = call_llm(
+            client,
             system=SYSTEM_PROMPT,
-            user=CLAUSE_PROMPT.format(category=cat, clause="\n\n".join(top_chunks)[:2500]),
-            api_key=api_key,
+            user=CLAUSE_PROMPT.format(
+                category=cat,
+                clause="\n\n".join(top_chunks)[:2500],
+            ),
         )
 
-        # Strip markdown fences
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+        # Strip markdown fences the model sometimes adds
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         try:
             parsed = json.loads(match.group()) if match else {}
@@ -179,15 +185,19 @@ def analyse_contract(pdf_path: str, api_key: str, progress=None) -> dict:
         parsed.setdefault("problematic_text", None)
         parsed.setdefault("safer_alternative", "Consult a lawyer for a safer version.")
         parsed.setdefault("explanation", raw[:300])
-
         analyses.append({"category": cat, **parsed})
+
+        time.sleep(3)   # stay within Groq free-tier rate limits
 
     # 5. Executive summary
     if progress: progress(0.92, "Writing executive summary...")
     summary = call_llm(
+        client,
         system=SYSTEM_PROMPT,
-        user=SUMMARY_PROMPT.format(doc_type=doc_type, analyses=json.dumps(analyses)),
-        api_key=api_key,
+        user=SUMMARY_PROMPT.format(
+            doc_type=doc_type,
+            analyses=json.dumps(analyses),
+        ),
         max_tokens=350,
     )
 
