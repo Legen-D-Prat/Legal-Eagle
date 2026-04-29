@@ -11,7 +11,7 @@ import requests
 from prompts import SYSTEM_PROMPT, CLAUSE_PROMPT, SUMMARY_PROMPT
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama3-8b-8192"
+GROQ_MODEL   = "llama-3.1-8b-instant"
 
 CATEGORIES = [
     "Indemnity",
