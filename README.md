@@ -2,6 +2,8 @@
 
 An AI-powered Streamlit web app that analyses PDF contracts for risky clauses and suggests safer alternatives. **100% free — uses open-source LLaMA 3 via Groq's free API.**
 
+Link: https://legal-eagle-w6kfuappvi92typz6ldrrub.streamlit.app
+
 ## Features
 - 📄 PDF upload with in-browser viewer
 - 🔍 Analyses 8 legal risk categories (Indemnity, Termination, Governing Law, etc.)
